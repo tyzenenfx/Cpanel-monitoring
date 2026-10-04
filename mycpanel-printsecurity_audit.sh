@@ -18,6 +18,7 @@
 
 export LC_ALL=C
 umask 022
+shopt -u patsub_replacement 2>/dev/null   # bash 5.2: keep a literal & in ${var//x/&y;} replacements
 START_EPOCH=$(date +%s)
 
 AUTH_TAIL="${AUTH_TAIL:-200000}"
@@ -26,6 +27,8 @@ SLOW_LINES="${SLOW_LINES:-20000}"
 MAX_2FA_USERS="${MAX_2FA_USERS:-1000}"
 CMD_TIMEOUT="${CMD_TIMEOUT:-20}"
 OUT_DIR="${OUT_DIR:-}"
+SYN_RECV_WARN="${SYN_RECV_WARN:-500}"; SYN_RECV_CRIT="${SYN_RECV_CRIT:-1000}"   # inbound  half-open
+SYN_SENT_WARN="${SYN_SENT_WARN:-200}"; SYN_SENT_CRIT="${SYN_SENT_CRIT:-500}"    # outbound half-open
 
 PUBLIC_IP="${PUBLIC_IP:-}"
 while getopts "o:i:h" opt; do
@@ -59,12 +62,13 @@ FINDINGS=""; SECTIONS=""; NAV=""
 SEC_ID=""; SEC_TITLE=""; SEC_BUF=""; SEC_WORST=0
 declare -A SEC_C=([FAIL]=0 [WARN]=0 [PASS]=0 [INFO]=0 [SKIP]=0)
 
-sec_open() { SEC_ID=$1; SEC_TITLE=$2; SEC_BUF=""; SEC_WORST=0; SEC_C=([FAIL]=0 [WARN]=0 [PASS]=0 [INFO]=0 [SKIP]=0); say "$2"; }
+sec_open() { SEC_ID=$1; SEC_TITLE=$2; SEC_BUF=""; SEC_WORST=0; SEC_BADGE=""; SEC_C=([FAIL]=0 [WARN]=0 [PASS]=0 [INFO]=0 [SKIP]=0); say "$2"; }
 sec_close() {
-  local cls=SKIP o=""
+  local cls=SKIP o="" lbl
   case $SEC_WORST in 4) cls=FAIL;; 3) cls=WARN;; 2) cls=PASS;; 1) cls=INFO;; esac
   [ "$SEC_WORST" -ge 3 ] && o=" open"
-  SECTIONS+="<section id=\"$SEC_ID\" data-title=\"$(hesc "$SEC_TITLE")\" data-f=\"${SEC_C[FAIL]}\" data-w=\"${SEC_C[WARN]}\" data-p=\"${SEC_C[PASS]}\" data-i=\"${SEC_C[INFO]}\" data-s=\"${SEC_C[SKIP]}\"><details$o><summary><span class=\"b $cls\">$cls</span> <span class=\"st\">$(hesc "$SEC_TITLE")</span><button type=\"button\" class=\"rm\" title=\"Remove this section from the report\" onclick=\"rmSec('$SEC_ID',event)\">&#10005; Remove</button></summary><div class=\"sbody\">$SEC_BUF</div></details></section>"$'\n'
+  lbl=$cls; [ -n "${SEC_BADGE:-}" ] && { cls=INFO; lbl=$SEC_BADGE; }
+  SECTIONS+="<section id=\"$SEC_ID\" data-title=\"$(hesc "$SEC_TITLE")\" data-f=\"${SEC_C[FAIL]}\" data-w=\"${SEC_C[WARN]}\" data-p=\"${SEC_C[PASS]}\" data-i=\"${SEC_C[INFO]}\" data-s=\"${SEC_C[SKIP]}\"><details$o><summary><span class=\"b $cls\">$lbl</span> <span class=\"st\">$(hesc "$SEC_TITLE")</span><button type=\"button\" class=\"rm\" title=\"Remove this section from the report\" onclick=\"rmSec('$SEC_ID',event)\">&#10005; Remove</button></summary><div class=\"sbody\">$SEC_BUF</div></details></section>"$'\n'
   NAV+="<label class=\"ni\" data-id=\"$SEC_ID\"><input type=\"checkbox\" checked onchange=\"tog('$SEC_ID',this.checked)\"><a href=\"#$SEC_ID\"><i class=\"dot $cls\"></i>$(hesc "$SEC_TITLE")</a></label>"
 }
 # chk SEVERITY label [detail]
@@ -181,7 +185,8 @@ svc_detect ftp      "FTP server"          "pure-ftpd|proftpd|vsftpd"            
 svc_detect dns      "DNS (BIND/PowerDNS)" "named|named-chroot|bind9|pdns"        "named pdns_server"         "named pdns_server"  "53" 1
 svc_detect csf      "CSF / LFD firewall"  "csf|lfd"                              "csf /etc/csf/csf.conf"     "lfd"                "" 0
 svc_detect fwd      "firewalld"           "firewalld"                            "firewall-cmd"              "firewalld"          "" 0
-svc_detect imunify  "Imunify360 / AV"     "imunify[a-z0-9-]*"                    "imunify360-agent imunify-agent imunify-antivirus" "imunify360-agent imunify-agent" "" 0
+svc_detect i360     "Imunify360"          "imunify360"                           "imunify360-agent"          ""                   "" 0
+svc_detect imav     "Imunify AV (antivirus)" "imunify-antivirus"                 "imunify-antivirus"         ""                   "" 0
 svc_detect bitninja "BitNinja"            "bitninja"                             "bnconfig /etc/bitninja"    "BitNinja"           "" 0
 
 CL_INST=0
@@ -199,7 +204,7 @@ get_public_ip() {
   local ip u main re='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
   [[ $PUBLIC_IP =~ $re ]] && { echo "$PUBLIC_IP"; return; }
   # 1) the server's MAIN IP: cPanel main shared IP, else the default-route source address
-  main=$(tr -d ' \r\n' < /var/cpanel/mainip 2>/dev/null)
+  main=$(cat /var/cpanel/mainip 2>/dev/null | tr -d ' \r\n')
   if ! [[ $main =~ $re ]]; then
     main=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="src"){print $(i+1);exit}}')
   fi
@@ -344,6 +349,15 @@ SUDOERS=$(grep -RhsE '^[[:space:]]*[a-zA-Z0-9_.-]+[[:space:]]+ALL[[:space:]]*=' 
 WHEEL=$( { getent group wheel; getent group sudo; } 2>/dev/null | awk -F: '{print $4}' | tr ',' '\n' | sed '/^$/d' | sort -u)
 chk INFO "Sudo users (sudoers)" "${SUDOERS:-none}"
 chk INFO "Wheel/sudo group members" "${WHEEL:-none}"
+# Shell-enabled accounts (UID >= 1000 with a login shell)
+CPU_LIST=""; [ -d /var/cpanel/users ] && CPU_LIST=$(ls /var/cpanel/users 2>/dev/null)
+SHELLU=$(awk -F: -v cp="$CPU_LIST" 'BEGIN{n=split(cp,a,"\n");for(i=1;i<=n;i++)C[a[i]]=1}
+  $3>=1000 && $3<65534 && $7!="" && $7 !~ /(nologin|false|noshell)$/ {t=($7 ~ /jailshell/)?"Jailed shell":"FULL shell"; print $1"\t"$7"\t"t"\t"(C[$1]?"cPanel account":"system/other")"\t"$6}' /etc/passwd 2>/dev/null | sort -t$'\t' -k3,3r -k1,1)
+SHN=$(printf '%s' "$SHELLU" | grep -c .); SHF=$(printf '%s\n' "$SHELLU" | awk -F'\t' '$3=="FULL shell"' | grep -c .)
+if   [ "$SHN" -eq 0 ]; then chk PASS "No accounts have shell access enabled"
+elif [ "$SHF" -gt 0 ]; then chk WARN "Shell access enabled for $SHN user(s), $SHF with an unrestricted shell" "Users with full shell: $(printf '%s\n' "$SHELLU" | awk -F'\t' '$3=="FULL shell"{print $1}' | head -n 15 | tr '\n' ' ')"
+else chk INFO "Shell access enabled for $SHN user(s) - all jailed" "Confirm each user needs shell access"; fi
+tbl $'Shell-enabled user\tShell\tType\tAccount type\tHome' "$SHELLU"
 # SSH authorized keys
 RK=0; [ -f /root/.ssh/authorized_keys ] && RK=$(grep -cE '^[[:space:]]*[^#[:space:]]' /root/.ssh/authorized_keys 2>/dev/null)
 [ "$RK" -gt 0 ] && chk INFO "root authorized_keys" "$RK key(s) present - confirm each is authorized" || chk PASS "No root authorized_keys"
@@ -494,14 +508,29 @@ else
     TOPN=$(printf '%s\n' "$TOP" | head -n1 | cut -f1)
     [ "${TOPN:-0}" -ge 200 ] && chk WARN "Single IP has $TOPN connections on :$P" "$(printf '%s\n' "$TOP" | head -n1 | cut -f2)"
   done
+  # Inbound: half-open connections arriving at this server
   SYN=$(printf '%s\n' "$SS_TAN" | awk '$1=="SYN-RECV"{n++}END{print n+0}')
-  if   [ "$SYN" -ge 1000 ]; then chk FAIL "SYN-RECV $SYN" "Possible SYN flood / severe connection pressure"
-  elif [ "$SYN" -ge 500  ]; then chk WARN "SYN-RECV $SYN" "Investigate possible SYN flood or traffic surge"
-  elif [ "$SYN" -ge 100  ]; then chk INFO "SYN-RECV $SYN" "Monitor rate and source distribution"
-  else chk PASS "SYN-RECV level normal" "$SYN"; fi
+  MSG_IN="Potential SYN_RECV DDoS attack detected! Please check network connections"
+  if   [ "$SYN" -ge "$SYN_RECV_CRIT" ]; then chk FAIL "Inbound DDoS check (SYN_RECV): $SYN" "$MSG_IN"
+  elif [ "$SYN" -ge "$SYN_RECV_WARN" ]; then chk WARN "Inbound DDoS check (SYN_RECV): $SYN" "$MSG_IN"
+  elif [ "$SYN" -ge 100 ]; then chk INFO "Inbound DDoS check (SYN_RECV): $SYN" "Elevated - monitor connection rate and source distribution (warn at $SYN_RECV_WARN)"
+  else chk PASS "Inbound DDoS check (SYN_RECV)" "$SYN half-open inbound connection(s) - normal"; fi
   if [ "$SYN" -ge 100 ]; then
     tbl $'Count\tSYN-RECV source IP' "$(printf '%s\n' "$SS_TAN" | awk '$1=="SYN-RECV"{ip=$5;sub(/:[0-9]+$/,"",ip);c[ip]++}END{for(i in c)print c[i]"\t"i}' | sort -t$'\t' -k1,1nr | head -n 15)"
     tbl $'Count\tSYN-RECV by dest port' "$(printf '%s\n' "$SS_TAN" | awk '$1=="SYN-RECV"{p=$4;sub(/^.*:/,"",p);c[p]++}END{for(i in c)print c[i]"\t"i}' | sort -t$'\t' -k1,1nr | head -n 10)"
+  fi
+  # Outbound: half-open connections this server is initiating (compromised-host / outbound flood indicator)
+  SYNS=$(printf '%s\n' "$SS_TAN" | awk '$1=="SYN-SENT"{n++}END{print n+0}')
+  MSG_OUT="Potential SYN_SENT DDoS attack detected! Please check network connections"
+  if   [ "$SYNS" -ge "$SYN_SENT_CRIT" ]; then chk FAIL "Outbound DDoS check (SYN_SENT): $SYNS" "$MSG_OUT"
+  elif [ "$SYNS" -ge "$SYN_SENT_WARN" ]; then chk WARN "Outbound DDoS check (SYN_SENT): $SYNS" "$MSG_OUT"
+  elif [ "$SYNS" -ge 100 ]; then chk INFO "Outbound DDoS check (SYN_SENT): $SYNS" "Elevated - monitor (warn at $SYN_SENT_WARN)"
+  else chk PASS "Outbound DDoS check (SYN_SENT)" "$SYNS outbound half-open connection(s) - normal"; fi
+  if [ "$SYNS" -ge 100 ]; then
+    tbl $'Count\tSYN-SENT destination IP' "$(printf '%s\n' "$SS_TAN" | awk '$1=="SYN-SENT"{ip=$5;sub(/:[0-9]+$/,"",ip);c[ip]++}END{for(i in c)print c[i]"\t"i}' | sort -t$'\t' -k1,1nr | head -n 15)"
+    tbl $'Count\tSYN-SENT destination port' "$(printf '%s\n' "$SS_TAN" | awk '$1=="SYN-SENT"{p=$5;sub(/^.*:/,"",p);c[p]++}END{for(i in c)print c[i]"\t"i}' | sort -t$'\t' -k1,1nr | head -n 10)"
+    # process attribution - only queried when the threshold is reached
+    tbl $'Count\tProcess opening the connections' "$(t ss -tanp state syn-sent | awk 'NR>1{p="-"; if(match($0,/\(\("[^"]+"/))p=substr($0,RSTART+3,RLENGTH-4); c[p]++}END{for(i in c)print c[i]"\t"i}' | sort -t$'\t' -k1,1nr | head -n 10)"
   fi
 fi
 sec_close
@@ -509,22 +538,40 @@ sec_close
 # ==========================================================================
 #  SECTION: Host protection (Imunify / BitNinja)
 # ==========================================================================
-sec_open protect "Malware / Intrusion Protection (Imunify360, BitNinja)"
-if svc_inst imunify; then
-  IM=""; for b in imunify360-agent imunify-agent imunify-antivirus; do have $b && { IM=$b; break; }; done
-  svc_up imunify && chk PASS "Imunify running" "${SV_DETAIL[imunify]}" || chk WARN "Imunify installed but no active service"
-  if [ -n "$IM" ]; then
-    raw "$IM version" "$(t $IM version)"
-    [ "$IM" = imunify-antivirus ] && raw "License" "$(t $IM show-license | head -n 20)"
-  fi
-  [ -f /var/log/imunify360/imunify360.log ] && raw "Recent Imunify360 log (20)" "$(tail -n 20 /var/log/imunify360/imunify360.log 2>/dev/null)"
-else chk SKIP "Imunify360 not installed"; fi
+sec_open protect "Malware / Intrusion Protection (Imunify, BitNinja)"
+imunify_report() { # key unit cli label
+  local key=$1 unit=$2 cli=$3 label=$4 u st rows="" prim
+  prim=$(systemctl is-active "$unit" 2>/dev/null)
+  if [ "$prim" = active ]; then chk PASS "$label service ($unit) is active"
+  else chk WARN "$label service ($unit) is ${prim:-not running}" "Check: systemctl status $unit"; fi
+  have systemctl && raw "systemctl status $unit" "$(t systemctl status "$unit" --no-pager -l | head -n 15)"
+  # companion units of the same product
+  for u in $(printf '%s\n' "$UNIT_FILES" | grep -oE "^imunify[a-z0-9-]*\.service" | sed 's/\.service$//' | sort -u); do
+    [ "$u" = "$unit" ] && continue
+    case $key in i360) [[ $u == imunify360* ]] || continue;; imav) [[ $u == imunify360* ]] && continue;; esac
+    st=$(systemctl is-active "$u" 2>/dev/null); rows+="$u"$'\t'"${st:-unknown}"$'\n'
+  done
+  [ -n "$rows" ] && tbl $'Companion service\tState' "$rows"
+  if have "$cli"; then
+    chk INFO "$label version" "$(t $cli version | head -n 3 | tr '\n' ' ')"
+    if [ "$key" = imav ]; then raw "$cli show-license" "$(t $cli show-license | head -n 20)"
+    else raw "$cli rstatus (registration/license)" "$(t $cli rstatus | head -n 20)"; fi
+  else chk INFO "$cli command not found" "Version/licence not shown"; fi
+}
+if svc_inst i360 || svc_inst imav; then
+  svc_inst i360 && imunify_report i360 imunify360 imunify360-agent "Imunify360"
+  svc_inst imav && imunify_report imav imunify-antivirus imunify-antivirus "Imunify AV"
+  svc_inst imav && ! svc_inst i360 && chk INFO "Imunify AV edition installed" "Malware scanning only - no Imunify360 firewall/WAF/proactive defense"
+  for lg in /var/log/imunify360/imunify360.log /var/log/imunify360/console.log /var/log/imunify360/error.log; do
+    [ -f "$lg" ] && raw "Recent log: $lg (20 lines)" "$(tail -n 20 "$lg" 2>/dev/null | cut -c1-250)"
+  done
+else chk SKIP "Imunify360 / Imunify AV not installed"; fi
 if svc_inst bitninja; then
   svc_up bitninja && chk PASS "BitNinja running" || chk WARN "BitNinja installed but not running"
   have bnconfig && raw "BitNinja version" "$(t bnconfig --version)"
   [ -d /var/log/bitninja ] && raw "Recent BitNinja logs" "$(find /var/log/bitninja -type f -printf '%TY-%Tm-%Td %TH:%TM %p\n' 2>/dev/null | sort -r | head -n 5)"
 else chk SKIP "BitNinja not installed"; fi
-! svc_inst imunify && ! svc_inst bitninja && chk INFO "No host-level malware/intrusion agent detected" "Rely on CSF/LFD + ModSecurity"
+! svc_inst i360 && ! svc_inst imav && ! svc_inst bitninja && chk INFO "No host-level malware/intrusion agent detected" "Rely on CSF/LFD + ModSecurity"
 sec_close
 
 # ==========================================================================
@@ -911,6 +958,9 @@ else
     raw "update_log (last 30 lines)" "$(tail -n 30 $UL)"
   fi
   printf '%s\n' "$PS_ALL" | awk '$0 ~ /cpanelup|upcp/ && $0 !~ /awk/' | grep -q . && chk INFO "cPanel update currently running"
+  # ---- WHM Terminal ----
+  if [ -e /var/cpanel/disable_whm_terminal_ui ]; then chk PASS "WHM Terminal is disabled" "/var/cpanel/disable_whm_terminal_ui exists"
+  else chk WARN "WHM Terminal is ENABLED" "Root shell is reachable from the WHM web UI. To disable: touch /var/cpanel/disable_whm_terminal_ui (not done by this script)"; fi
   # ---- 2FA (WHM API v1) ----
   if ! have whmapi1; then chk SKIP "whmapi1 not found" "2FA checks skipped"
   else
@@ -935,6 +985,57 @@ else
   fi
 fi
 sec_close
+
+# ==========================================================================
+#  SECTION: Manual verification checklist (cPanel/WHM only)
+# ==========================================================================
+if [ $CP_INST -eq 1 ]; then
+  sec_open manual "Manual Verification Checklist (cPanel/WHM)"
+  SEC_BADGE="MANUAL"
+  CK_N=0; CK_HTML=""
+  ck_group() { CK_HTML+="<h3 class=\"ckg\">$(hesc "$1")</h3>"; }
+  ck_item()  { CK_N=$((CK_N+1)); CK_HTML+="<label class=\"ck\"><input type=\"checkbox\" data-k=\"c$CK_N\"><span>$(hesc "$1")</span></label>"; }
+  ck_group "WHM >> Security Center"
+  ck_item "Run cPanel Security Advisor and enable all recommendations"
+  ck_item "Enable mod_userdir Protection"
+  ck_item "Enable SMTP Restrictions"
+  ck_item "Disable Compiler Access"
+  ck_item "Configure Security Policies"
+  ck_item "Host Access Control to restrict WHM & SSH Port Access"
+  ck_item "Enable OWASP ModSecurity Rule Set"
+  ck_item "Enable Shell Fork Bomb Protection"
+  ck_group "WHM >> Service Configuration >> Apache Configuration >> Global Configuration"
+  ck_item "Enable Symlink Protection & Keep-Alive settings"
+  ck_group "WHM >> Service Configuration >> Exim Configuration Manager"
+  ck_item "Enable Dictionary attack protection"
+  ck_item "Enable Reject remote mail sent to the server's hostname"
+  ck_item "Enable Reference /etc/mailips for custom IP on outgoing SMTP connections"
+  ck_item "Enable System Filter File"
+  ck_item "Enable Set SMTP Sender: headers"
+  ck_item "Enable Custom RBLs"
+  ck_item "Scan outgoing messages for malware"
+  ck_group "WHM >> Service Configuration >> FTP Server Configuration"
+  ck_item "Disable Allow Anonymous Logins & Allow Anonymous Uploads"
+  ck_item "Disable Allow Logins with Root Password"
+  ck_group "WHM >> SSL/TLS >> Manage AutoSSL"
+  ck_item "Enable AutoSSL for all users"
+  ck_group "WHM >> System Health"
+  ck_item "Enable Background Process Killer"
+  ck_group "WHM >> Plugins >> ConfigServer Security & Firewall"
+  ck_item "Perform Check Server Security and do the needful changes"
+  ck_group "WHM >> Server Configuration >> Tweak Settings"
+  ck_item "Enable DKIM & SPF on domains for newly created accounts"
+  ck_item "Set Max hourly emails per domain"
+  ck_item "Set Initial default/catch-all forwarder destination to Fail"
+  ck_item "Enable Track email origin via X-Source email headers"
+  ck_item "Enable Restrict outgoing SMTP to root, exim, and mailman"
+  ck_item "Enable Prevent \"nobody\" from sending mail"
+  ck_item "Enable Apache SpamAssassin spam filter"
+  ck_item "Enable Blank referrer safety check & Referrer safety check"
+  SEC_BUF+="<p class=\"note\">These settings cannot be verified safely from the shell. Review each in WHM and tick it off - ticks are remembered in this browser and are included when you print / save as PDF.</p>"
+  SEC_BUF+="<div class=\"ckbar\"><b id=\"ckprog\">0 of $CK_N verified</b><span><button type=\"button\" onclick=\"ckAll(true)\">Tick all</button> <button type=\"button\" onclick=\"ckAll(false)\">Clear</button></span></div><div id=\"cklist\" data-total=\"$CK_N\">$CK_HTML</div>"
+  sec_close
+fi
 
 # ==========================================================================
 #  Assemble HTML
@@ -1004,6 +1105,9 @@ pre{background:var(--pre);color:var(--preink);padding:12px;border-radius:8px;ove
 nav .nh{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--mute);padding:6px 8px}
 .rm{margin-left:auto;background:transparent;color:var(--mute);border:1px solid var(--line);border-radius:6px;padding:2px 8px;font-size:12px;cursor:pointer}.rm:hover{color:var(--fail);border-color:var(--fail)}
 .hidden{display:none!important}
+.ckg{margin:14px 0 4px;font-size:13px;color:var(--accent)}.ck{display:flex;gap:10px;align-items:flex-start;padding:5px 0;cursor:pointer}.ck input{margin-top:3px;width:16px;height:16px;flex:none}
+.ck:has(input:checked) span{color:var(--mute);text-decoration:line-through}
+.ckbar{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0}.ckbar button{background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:3px 10px;cursor:pointer}
 .tools{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}.tools button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
 .tools button{background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:6px 12px;cursor:pointer}
 footer{color:var(--mute);font-size:12px;text-align:center;padding:16px}
@@ -1052,6 +1156,12 @@ function recalc(){var c={f:0,w:0,p:0,i:0,s:0},hid={};
  for(var k in m){var e=document.getElementById('c-'+k);if(e)e.textContent=c[m[k]];}
  var t=c.p+c.w+c.f,r=document.getElementById('c-RATE');if(r)r.textContent=(t?Math.round(c.p*100/t):0)+'%';
  document.querySelectorAll('#findings tbody tr').forEach(function(tr){var td=tr.children[1];tr.classList.toggle('hidden',!!(td&&hid[td.textContent.trim()]));});}
+var CKK='audit-ck:'+location.pathname;
+function ckSave(){var o={};document.querySelectorAll('#cklist input').forEach(i=>{if(i.checked)o[i.dataset.k]=1});try{localStorage.setItem(CKK,JSON.stringify(o));}catch(e){}}
+function ckProg(){var l=document.getElementById('cklist');if(!l)return;var n=l.querySelectorAll('input:checked').length;document.getElementById('ckprog').textContent=n+' of '+l.dataset.total+' verified';}
+function ckAll(v){document.querySelectorAll('#cklist input').forEach(i=>i.checked=v);ckSave();ckProg();}
+(function(){var l=document.getElementById('cklist');if(!l)return;var o={};try{o=JSON.parse(localStorage.getItem(CKK)||'{}');}catch(e){}
+ l.querySelectorAll('input').forEach(i=>{i.checked=!!o[i.dataset.k];i.addEventListener('change',function(){ckSave();ckProg();});});ckProg();})();
 window.addEventListener('beforeprint',function(){document.querySelectorAll('section details').forEach(d=>d.open=true);});
 </script>
 </body></html>
