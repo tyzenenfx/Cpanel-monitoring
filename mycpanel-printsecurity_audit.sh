@@ -61,15 +61,21 @@ declare -A SEV_RANK=([SKIP]=0 [INFO]=1 [PASS]=2 [WARN]=3 [FAIL]=4)
 FINDINGS=""; SECTIONS=""; NAV=""
 SEC_ID=""; SEC_TITLE=""; SEC_BUF=""; SEC_WORST=0
 declare -A SEC_C=([FAIL]=0 [WARN]=0 [PASS]=0 [INFO]=0 [SKIP]=0)
+declare -A SEC_CK=()
+SEC_HTML=(); SEC_NAV=(); SEC_RANK=()
 
-sec_open() { SEC_ID=$1; SEC_TITLE=$2; SEC_BUF=""; SEC_WORST=0; SEC_BADGE=""; SEC_C=([FAIL]=0 [WARN]=0 [PASS]=0 [INFO]=0 [SKIP]=0); say "$2"; }
+sec_open() { SEC_ID=$1; SEC_TITLE=$2; SEC_BUF=""; SEC_WORST=0; SEC_BADGE=""; SEC_CK=([FAIL]="" [WARN]="" [INFO]="" [PASS]="" [SKIP]=""); SEC_C=([FAIL]=0 [WARN]=0 [PASS]=0 [INFO]=0 [SKIP]=0); say "$2"; }
 sec_close() {
-  local cls=SKIP o="" lbl
+  local cls=SKIP o="" lbl r ck="" rank body
   case $SEC_WORST in 4) cls=FAIL;; 3) cls=WARN;; 2) cls=PASS;; 1) cls=INFO;; esac
   [ "$SEC_WORST" -ge 3 ] && o=" open"
-  lbl=$cls; [ -n "${SEC_BADGE:-}" ] && { cls=INFO; lbl=$SEC_BADGE; }
-  SECTIONS+="<section id=\"$SEC_ID\" data-title=\"$(hesc "$SEC_TITLE")\" data-f=\"${SEC_C[FAIL]}\" data-w=\"${SEC_C[WARN]}\" data-p=\"${SEC_C[PASS]}\" data-i=\"${SEC_C[INFO]}\" data-s=\"${SEC_C[SKIP]}\"><details$o><summary><span class=\"b $cls\">$lbl</span> <span class=\"st\">$(hesc "$SEC_TITLE")</span><button type=\"button\" class=\"rm\" title=\"Remove this section from the report\" onclick=\"rmSec('$SEC_ID',event)\">&#10005; Remove</button></summary><div class=\"sbody\">$SEC_BUF</div></details></section>"$'\n'
-  NAV+="<label class=\"ni\" data-id=\"$SEC_ID\"><input type=\"checkbox\" checked onchange=\"tog('$SEC_ID',this.checked)\"><a href=\"#$SEC_ID\"><i class=\"dot $cls\"></i>$(hesc "$SEC_TITLE")</a></label>"
+  rank=$SEC_WORST
+  lbl=$cls; [ -n "${SEC_BADGE:-}" ] && { cls=INFO; lbl=$SEC_BADGE; rank=1; }
+  for r in FAIL WARN INFO PASS SKIP; do ck+="${SEC_CK[$r]}"; done      # most severe first
+  body="<div class=\"checks\">$ck</div>$SEC_BUF"
+  SEC_HTML+=("<section id=\"$SEC_ID\" data-title=\"$(hesc "$SEC_TITLE")\" data-f=\"${SEC_C[FAIL]}\" data-w=\"${SEC_C[WARN]}\" data-p=\"${SEC_C[PASS]}\" data-i=\"${SEC_C[INFO]}\" data-s=\"${SEC_C[SKIP]}\"><details$o><summary><span class=\"b $cls\">$lbl</span> <span class=\"st\">$(hesc "$SEC_TITLE")</span><button type=\"button\" class=\"rm\" title=\"Remove this section from the report\" onclick=\"rmSec('$SEC_ID',event)\">&#10005; Remove</button></summary><div class=\"sbody\">$body</div></details></section>")
+  SEC_NAV+=("<label class=\"ni\" data-id=\"$SEC_ID\"><input type=\"checkbox\" checked onchange=\"tog('$SEC_ID',this.checked)\"><a href=\"#$SEC_ID\"><i class=\"dot $cls\"></i>$(hesc "$SEC_TITLE")</a></label>")
+  SEC_RANK+=("$rank")
 }
 # chk SEVERITY label [detail]
 chk() {
@@ -80,9 +86,9 @@ chk() {
     flat=${detail//$'\n'/ | }; flat=${flat//$'\t'/ }
     FINDINGS+="${SEV_RANK[$sev]}"$'\t'"$sev"$'\t'"$SEC_TITLE"$'\t'"$label"$'\t'"${flat:0:300}"$'\n'
   fi
-  SEC_BUF+="<div class=\"chk\"><span class=\"b $sev\">$sev</span><div><b>$(hesc "$label")</b>"
-  [ -n "$detail" ] && SEC_BUF+="<span class=\"d\">$(hesc "$detail")</span>"
-  SEC_BUF+="</div></div>"$'\n'
+  SEC_CK[$sev]+="<div class=\"chk\"><span class=\"b $sev\">$sev</span><div><b>$(hesc "$label")</b>"
+  [ -n "$detail" ] && SEC_CK[$sev]+="<span class=\"d\">$(hesc "$detail")</span>"
+  SEC_CK[$sev]+="</div></div>"$'\n'
 }
 note() { SEC_BUF+="<p class=\"note\">$(hesc "$1")</p>"$'\n'; }
 raw() { # title text
@@ -185,8 +191,11 @@ svc_detect ftp      "FTP server"          "pure-ftpd|proftpd|vsftpd"            
 svc_detect dns      "DNS (BIND/PowerDNS)" "named|named-chroot|bind9|pdns"        "named pdns_server"         "named pdns_server"  "53" 1
 svc_detect csf      "CSF / LFD firewall"  "csf|lfd"                              "csf /etc/csf/csf.conf"     "lfd"                "" 0
 svc_detect fwd      "firewalld"           "firewalld"                            "firewall-cmd"              "firewalld"          "" 0
-svc_detect i360     "Imunify360"          "imunify360"                           "imunify360-agent"          ""                   "" 0
-svc_detect imav     "Imunify AV (antivirus)" "imunify-antivirus"                 "imunify-antivirus"         ""                   "" 0
+# Imunify products are identified by THEIR OWN systemd service; a shared CLI binary alone does not count
+I360_BINS="imunify360-agent"; IMAV_BINS="imunify-antivirus"
+[ $HAVE_SYSTEMD -eq 1 ] && { I360_BINS=""; IMAV_BINS=""; }
+svc_detect i360     "Imunify360"          "imunify360"                           "$I360_BINS"                ""                   "" 0
+svc_detect imav     "Imunify AV (antivirus)" "imunify-antivirus"                 "$IMAV_BINS"                ""                   "" 0
 svc_detect bitninja "BitNinja"            "bitninja"                             "bnconfig /etc/bitninja"    "BitNinja"           "" 0
 
 CL_INST=0
@@ -554,7 +563,10 @@ imunify_report() { # key unit cli label
   [ -n "$rows" ] && tbl $'Companion service\tState' "$rows"
   if have "$cli"; then
     chk INFO "$label version" "$(t $cli version | head -n 3 | tr '\n' ' ')"
-    if [ "$key" = imav ]; then raw "$cli show-license" "$(t $cli show-license | head -n 20)"
+    if [ "$key" = imav ]; then
+      LIC=$(t2 $cli show-license | head -n 20)
+      printf '%s' "$LIC" | grep -qiE 'usage:|invalid choice|unrecognized|error' && LIC=$(t2 $cli rstatus | head -n 20)
+      raw "$cli licence / registration status" "$LIC"
     else raw "$cli rstatus (registration/license)" "$(t $cli rstatus | head -n 20)"; fi
   else chk INFO "$cli command not found" "Version/licence not shown"; fi
 }
@@ -1047,6 +1059,9 @@ SAFE_HOST=$(printf '%s' "$HOST" | tr -c 'A-Za-z0-9.-' '_')
 FNAME="security_audit_${SAFE_HOST}_${TS}_${TOKEN}.html"
 OUT="$OUT_DIR/$FNAME"
 
+ORDER=$(for i in "${!SEC_RANK[@]}"; do [ "$i" -eq 0 ] && continue; printf '%s %s\n' "${SEC_RANK[$i]}" "$i"; done | sort -k1,1nr -k2,2n | awk '{print $2}')
+SECTIONS="${SEC_HTML[0]}"$'\n'; NAV="${SEC_NAV[0]}"
+for i in $ORDER; do SECTIONS+="${SEC_HTML[$i]}"$'\n'; NAV+="${SEC_NAV[$i]}"; done
 FSORT=$(printf '%s' "$FINDINGS" | sort -s -t$'\t' -k1,1nr | cut -f2-)
 SEC_BUF=""
 FROWS=$(printf '%s\n' "$FSORT" | awk -F'\t' 'NF>=3{print $1"\t"$2"\t"$3"\t"$4}')
@@ -1105,6 +1120,7 @@ pre{background:var(--pre);color:var(--preink);padding:12px;border-radius:8px;ove
 nav .nh{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--mute);padding:6px 8px}
 .rm{margin-left:auto;background:transparent;color:var(--mute);border:1px solid var(--line);border-radius:6px;padding:2px 8px;font-size:12px;cursor:pointer}.rm:hover{color:var(--fail);border-color:var(--fail)}
 .hidden{display:none!important}
+.checks{margin-bottom:4px}
 .ckg{margin:14px 0 4px;font-size:13px;color:var(--accent)}.ck{display:flex;gap:10px;align-items:flex-start;padding:5px 0;cursor:pointer}.ck input{margin-top:3px;width:16px;height:16px;flex:none}
 .ck:has(input:checked) span{color:var(--mute);text-decoration:line-through}
 .ckbar{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0}.ckbar button{background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:3px 10px;cursor:pointer}
@@ -1114,11 +1130,12 @@ footer{color:var(--mute);font-size:12px;text-align:center;padding:16px}
 @media(max-width:900px){.layout{grid-template-columns:1fr;padding:12px}nav{position:static;max-height:none}}
 @page{size:A4;margin:12mm}
 @media print{
-:root{--bg:#fff;--card:#fff;--ink:#111;--mute:#444;--line:#cfd6df;--pre:#f3f5f8;--preink:#111;--pass:#15803d;--passbg:#dcfce7;--warn:#b45309;--warnbg:#fef3c7;--fail:#b91c1c;--failbg:#fee2e2;--info:#1d4ed8;--infobg:#dbeafe;--skip:#64748b;--skipbg:#e2e8f0;--accent:#1e3a8a}
+:root{--bg:#f4f6f9;--card:#fff;--ink:#1b2430;--mute:#637083;--line:#e3e8ef;--pre:#0f172a;--preink:#e2e8f0;--pass:#15803d;--passbg:#dcfce7;--warn:#b45309;--warnbg:#fef3c7;--fail:#b91c1c;--failbg:#fee2e2;--info:#1d4ed8;--infobg:#dbeafe;--skip:#64748b;--skipbg:#e2e8f0;--accent:#1e3a8a}
 *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+body{background:var(--bg)}.cards{grid-template-columns:repeat(6,1fr)}.card b{font-size:20px}
 nav,.tools,.rm{display:none!important}.layout{display:block;padding:0;max-width:none}
-section,.panel{break-inside:auto;border-color:var(--line)}section>details>summary{break-after:avoid}.chk,tr{break-inside:avoid}
-pre{max-height:none!important;overflow:visible;border:1px solid var(--line)}header{break-inside:avoid}}
+section,.panel{break-inside:auto}section>details>summary{break-after:avoid}.chk,tr{break-inside:avoid}
+pre{max-height:none!important;overflow:visible}header{break-inside:avoid}}
 </style></head><body><div class="layout">
 <nav><div class="nh">Sections - untick to remove</div><label class="ni"><span style="width:13px"></span><a href="#overview"><i class="dot INFO"></i>Overview</a></label>$NAV</nav>
 <main>
